@@ -112,5 +112,43 @@ class PdictTest(unittest.TestCase):
         self.assertEqual(h['*.*.ip'], {'info': ['192.168.0.1', '192.168.0.2'], 'info2': {'en0': '192', 'en1': '193'}})
 ```
 
+```
 
+def pwsegment(argv):
+    parser = ArgumentParser()
+    parser.add_argument('-f', '--fg', nargs='*', choices=_COLORS)
+    parser.add_argument('-b', '--bg', nargs='*', choices=_COLORS)
+    parser.add_argument('segments', nargs='+')
+    args = parser.parse_args(args=argv)
+    #print(args)
+    args.bg = [f'LIGHT{v[1:].upper()}_EX' if v.startswith('l') else v.upper() for v in args.bg] if args.bg else None
+    args.fg = [f'LIGHT{v[1:].upper()}_EX' if v.startswith('l') else v.upper() for v in args.fg] if args.fg else None
+    print(Segment(args.segments, args.bg, args.fg))
+
+def bash_prompt():
+    print(r"""
+parse_git_branch() {
+  git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/'
+}
+parse_git_clean() {
+  [[ $(git status 2> /dev/null |tail -n1) =  "nothing to commit"* ]] && echo green || echo magenta
+}
+exit_status_color() {
+    [ "$1" = 0 ] && echo green || echo red
+}
+PS1='$(s="$?";pwsegment "$s" "\u@\h" "\w" "$(parse_git_branch)" -b $(exit_status_color "$s") blue lblack $(parse_git_clean) -f white white white black)\n$ '
+""")
+
+_COLORS = (
+    'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+    'lblack', 'lred', 'lgreen', 'lyellow', 'lblue', 'lmagenta', 'lcyan', 'lwhite'
+)
+
+if __name__ == '__main__':
+    import sys
+    if(len(sys.argv)==1):
+        bash_prompt()
+        sys.exit(0)
+    pwsegment(sys.argv[1:])
+```
 
