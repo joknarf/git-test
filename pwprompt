@@ -1,4 +1,5 @@
 #!/bin/bash
+# Author: Franck Jouvanceau
 [ "$1" = activate ] && cat $0 && exit 0
 type typeset >/dev/null 2>&1 || alias typeset=''  # ash no typeset
 
