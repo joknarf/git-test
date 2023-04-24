@@ -1,13 +1,19 @@
 #!/bin/bash
 # Author: Franck Jouvanceau
+# Powerline prompt with AWK (bash/zsh/ksh)
+
 [ "$1" = activate ] && cat $0 && exit 0
 type typeset >/dev/null 2>&1 || alias typeset=''  # ash no typeset
+if [ "$ZSH_VERSION" ];then
+    setopt PROMPT_SUBST
+    setopt sh_word_split # for i in $var
+fi
 
 pwline() {
-    : ${COLUMNS:=$(stty size)} # ash no $COLUMNS
+    : ${COLUMNS:=$(stty size 2>/dev/null)} # ash no $COLUMNS
     COLUMNS=${COLUMNS#* }
-
-    awk -v pcol="$ps1_colors" -v columns="$COLUMNS" '
+    [ -x /bin/nawk ] && AWK=nawk || AWK=awk
+    $AWK -v pcol="$ps1_colors" -v columns="$COLUMNS" '
     function init_symbols() {
         sym[">"] = ""; sep[">"] = ""; rev[">"]=0 # \ue0b0 \ue0b1
         sym[")"] = ""; sep[")"] = ""; rev[")"]=0 # \ue0b4 \ue0b5
@@ -27,6 +33,8 @@ pwline() {
         colors["reset_all"] = csi "0m"
         colors["reset"] = csi "39m"
         colors["breset"] = csi "49m"
+        colors["wrapoff"] = csi "?7l"
+        colors["wrapon"] = csi "?7h"
     }
     function getcols(info,    colinfo, i) {
         split(info, colinfo, "/")
@@ -58,11 +66,12 @@ pwline() {
         init_colors()
         init_symbols()
         split(pcol, pcols, " ")
+        printf("%s", colors["wrapoff"])
         #pw_symbol = sprintf("%c", strtonum("0xE0B0"))
         for (i=1;i<ARGC;i++) {
             text=ARGV[i]
             if (text=="|") {
-                emptywidth = columns - width
+                emptywidth = columns - width -1 # avoid last column for resize
                 for(j=ARGC-1;j>i;j--) {
                     text = gettext(ARGV[j])
                     if (text == "") continue
@@ -103,30 +112,30 @@ pwline() {
         }
         #if (! rev)
         #    printf("%s", colors[bg] colors["breset"] symbol)
-        printf("%s\n", colors["reset_all"])
+        printf("%s%s\n", colors["reset_all"], colors["wrapoff"])
     }' "$@"
 }
 
 
-parse_git_branch() {
+ps1_git_branch() {
     typeset git_head=.git/HEAD i git_branch
     for i in . . . . . .;do
         [ -r "$git_head" ] && break
         git_head="../$git_head"
     done
-    [ -r "$git_head" ] || return
+    [ ! -r "$git_head" ] && echo ':' && return
     git_branch=$(sed -e 's#.*/##' "$git_head")
     [ "$skip_git_status" ] && echo "${ps1_git_colors% *}:$git_branch" && return
-    [[ "$(git status -uno 2> /dev/null |tail -n1)" = "nothing to commit"* ]] && echo "${ps1_git_colors% *}:$git_branch" || echo "${ps1_git_colors#* }:$git_branch"
+    [[ "$(git status -uno --no-ahead-behind 2> /dev/null |tail -n1)" = "nothing to commit"* ]] && echo "${ps1_git_colors% *}:$git_branch" || echo "${ps1_git_colors#* }:$git_branch"
     #git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/'
 }
 
-short_hostname() {
+ps1_userhost() {
     typeset hostname=$(uname -n)
-    echo ${hostname%%.*}
+    echo $USER@${hostname%%.*}
 }
 
-short_pwd() {
+ps1_cwd() {
     typeset spwd=$PWD 
     typeset -i cols=${COLUMNS:-80}
     [[ $PWD = $HOME* ]] && spwd="~${PWD#$HOME}"
@@ -134,51 +143,75 @@ short_pwd() {
     echo "$spwd"
 }
 
-exit_status_color() {
+ps1_exit_status() {
     [ "$1" = 0 ] && echo "${ps1_exit_colors% *}:"|| echo "${ps1_exit_colors#* }:$1"
 }
 
 ps1_info() {
     eval echo -n \""$ps1_info"\"
-    for i in $ps1_vars;do
-        eval echo -n \"'|$'"${i}"\"
+    for i in $ps1_info_vars;do
+        eval echo -n \"'|${'"$i"'}'\"
     done
 }
 
+ps1_uidprompt() {
+    [ "$USER" = root ] && echo '#' || echo '$'    
+}
+
 ps1_prompt() {
-    typeset exit_status='"$(exit_status_color $?)"'
-    typeset git_branch='"$(parse_git_branch)"'
-    typeset other_info='":$(ps1_info)"'
-    typeset cur_dir='":$(short_pwd)"'
-    typeset pre="" post="" prompt=""
     if [ "$BASH" ];then
-        user_host='":\u@\h"'
-        cur_dir='":\w"'
-        time='":\A"'
+        shell=bash
+        prompt='\$'
         pre='\['
         post='\]'
-        prompt='\$'
     elif [ "$ZSH_VERSION" ];then
-        setopt PROMPT_SUBST
-        setopt sh_word_split # for i in $var
-        # cannot use directly ":%n@%m" ":%d" because substituted after execution (width calculation impossible)
-        user_host='":$(print -P "%n@%m")"'
-        time='":$(print -P "%T")"'
+        shell=zsh
+        prompt='%(!.#.$)'
         pre='%{'
         post='%}'
-        prompt='%(!.#.$)'
     else
-        user_host='":$USER@$(short_hostname)"'
-        time='":$(date +%H:%M)"'
-        [ "$USER" = root ] && prompt='#' || prompt='$'
+        shell=other
+        prompt="'$(ps1_uidprompt)'"
     fi
-    PS1="$pre\$(pwline $exit_status $user_host $cur_dir $git_branch '>' '|' $other_info $time ')')$post
-$prompt "
+    echo -ne "$pre"'$(pwline '
+    awk -v shell="$shell" 'BEGIN {
+        cmd["exit_status"] = "$(ps1_exit_status $?)"
+        if (shell == "bash") {
+            cmd["userhost"] = "\\u@\\h"
+            cmd["cwd"] = "\\w"
+            cmd["time"] = "\\A"
+            cmd["prompt"] = "\\$"
+        } else if (shell == "zsh") {
+            cmd["userhost"] = "$(print -P %n@%m)"
+            cmd["time"] = "$(print -P %T)"
+            cmd["prompt"] = "%(!.#.$)"
+        } else 
+            cmd["time"] = "$(date +%H:%M)"
+        nb = split(ARGV[1], segments, " ")
+        for (i=1; i<=nb; i++) {
+            n = split(segments[i], info, ":")
+            if (n==1) {
+                printf("\"%s\" ", info[1])
+                continue
+            }
+            sep=":"
+            if (info[1]~/auto/) { sep = ""; sub("auto","",info[1]) }
+            if (info[2] in cmd)
+                printf("\"%s%s%s\" ", info[1], sep, cmd[info[2]])
+            else
+                printf("\"%s%s$(ps1_%s)\" ", info[1], sep, info[2])
+        }
+    }' "$@"
+    echo ")$post"
+    echo "$prompt "
 }
-: ${PROMPT_DIRTRIM:=4}
-: ${ps1_info:='${VIRTUAL_ENV##*[/\\\\]}'}
-: ${ps1_vars:='client_id ORACLE_SID'}
+
+: ${PROMPT_DIRTRIM:=5}
+: #${ps1_info:='$(echo uid:$(id -u))'}
+: ${ps1_info_vars:='client_id ORACLE_SID VIRTUAL_ENV##*[/\\\\]'}     
 : ${ps1_exit_colors:="green red"}
 : ${ps1_git_colors:="green yellow/black"}
-: ${ps1_colors:="(/green (/blue )/lblack >/yellow/black > | </lblue/black/blue (/blue )"}
-ps1_prompt
+# create powerline prompt
+# (exit_status(user@host)cwd>gitbranch>     ----->       <info1<info2...(time)
+PS1="$(ps1_prompt "(/auto:exit_status (/blue:userhost )/lblack:cwd >/auto:git_branch > \
+                                            | </lblue/black/blue:info (/blue:time )")"
