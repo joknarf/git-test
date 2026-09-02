@@ -1,0 +1,113 @@
+#!/bin/bash
+
+
+body() {
+    local header
+    IFS='' read header
+    echo "$header"
+    "$@"
+}
+
+# bg run command with lock
+# check lock / detect hanging command
+# return 1: previous lock still active
+# return 2: lock still active after timeout (but process successfully killed)
+# retuen 3: lock still active killing process not releasing lock
+mutex_run() {
+    local outf="$1" timeout="$2" nohang=0 cmd pid
+    shift 2
+    cmd=("$@")
+    lockf="$outf.lock"
+    ! flock -n "$lockf" true && return 1
+    setsid nohup flock -n "$lockf" "${cmd[@]}" >"$outf" 2>"$outf.err" </dev/null & 
+    pid=$!
+    ((timeout*=2))
+    while ((timeout>0));do
+        sleep 0.5
+        flock -n "$lockf" true && nohang=1 && break
+        ((timeout--))
+    done
+    ((nohang)) && return 0
+    kill -- -$pid;sleep 0.5;kill -9 -- -$pid 2>/dev/null;sleep 0.5
+    flock -n "$lockf" true && return 2
+    return 3
+}
+
+check_fs() {
+    local fs="$1" dev="$2" hang=1 outf nfssrv
+    outf="$tmpdir/.nfs_${fs//\//}"
+    echo "INFO:$fs: Checking '$dev' on '$fs'"
+    mutex_run "$outf" 5 df -h $fs
+    e=$?
+    nfssrv="${dev%%:*}"
+    ((e>0 && e<=3)) && [[ " ${nfshangs[*]} " != *\ $nfssrv\ * ]] && nfshangs+=("$nfssrv")
+    case "$e" in
+         0) ;;
+         1) echo "ERROR:$fs: LOCKED: NFS STILL HANG";return 1;;
+         2) echo "ERROR:$fs: NFS HANG";return 2;;
+         3) echo "ERROR:$fs: NFS HANG, KILL df FAILED";return 3;;
+         *) echo "ERROR:$fs: unknown error";return 130;;
+    esac
+    cat "$outf" "$outf.err"
+    grep -q 'Stale' "$outf.err" && echo "ERROR:$fs: NFS STALE" && return 4
+    [ -s "$outf.err" ] && "ERROR:$fs: df ERROR" && return 5
+    echo "INFO:$fs: Check $fs OK"
+    return 0
+}
+
+tcpdump_trace() {
+   local nfssrv="$1" srvip srvname
+   read srvip srvname _ < <(getent ahostsv4 "$nfssrv")
+   timeout 60 sudo tcpdump -i eth0 -nn -s 0 -B 65536 -C 100 -W 10 -w /tmp/nfs4_hang.$srvip.pcap host $srvip and port 2049
+   # tcpdump -nn -tttt -r /tmp/nfs4_hang*.pcap
+}
+
+hang_traces() {
+   local nfssrv
+   nfsstat -c >/tmp/nfsstat-c.out
+   cat /proc/net/rpc/nfs >/tmp/rpc_nfs.out
+   for nfssrv in "${nfshangs[@]}";do
+       tcpdump_trace $nfssrv &
+   done
+   wait
+}
+
+check_all_nfs() {
+    local fs dev e=0
+    while read fs dev;do
+        check_fs "$fs" "$dev" || ((e++))
+    done < <(awk '$3=="nfs4"{print $2,$1}' /etc/mtab)
+    return $e
+}
+
+check_dstate() {
+    local outf="$tmpdir/.ps_dstate"
+    echo "INFO:dstate: checking dstate processes"
+    mutex_run "$outf" 5 ps -e -o pid,ppid,stime,state,wchan:30,uid,args
+    case "$?" in
+         0) ;;
+         1) echo "ERROR:dstate: LOCKED: ps command still hanging" && return 1;;
+         2) echo "ERROR:dstate: ps command hang" && return 2;;
+         3) echo "ERROR:dstate: ps command hang, KILL of ps FAILED" && return 3;;
+         *) echo "ERROR:dstate: unknown error" && return 130;;
+    esac
+    body awk '$4=="D"' <$outf
+}
+
+check_dmesg() {
+    echo "INFO:dmesg: Checking dmesg errors"
+    dmesg -T |egrep  "NFS.*: |nfs: server .* not responding" && echo "ERROR:dmesg: NFS ERROR" && return 1
+    echo "INFO:dmesg: Check OK"
+    return 0
+}
+
+tmpdir='/tmp/.nfs_health'
+mkdir -p "$tmpdir"
+e=0
+nfshangs=()
+check_dmesg || ((e++))
+check_all_nfs || ((e++))
+check_dstate || ((e++))
+hang_traces
+exit $e
+
