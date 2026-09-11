@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+nodes=(
+  ip-xxx-xxx-xxx-xxx.compute.eu-fr-paris.cloud.company
+  ip-yyy-yyy-yyy-yyy.compute.eu-fr-north.cloud.company
+  ip-zzz-zzz-zzz-zzz.compute.eu-fr-paris.cloud.company
+)
+
+fqdn0=(${nodes[0]//./ })
+common=("${fqdn0[@]//*/1}")
+
+for node in "${nodes[@]:1}";do
+    fqdn=(${node//./ })
+    for ((i=1;i<${#fqdn0[@]};i++));do
+        [ "${fqdn0[i]}" = "${fqdn[i]}" ] || common[i]=0
+    done
+done
+
+short_nodes=()
+for node in "${nodes[@]}";do
+    fqdn=(${node//./ })
+    short_node="${fqdn[0]}"
+    for ((i=1;i<${#fqdn[@]};i++));do
+        ((! common[i])) && short_node+=".${fqdn[i]}" || {
+          [[ $short_node != *.. ]] && short_node+='.'
+        }
+    done
+    short_nodes+=($short_node)
+done
+printf '%s\n' "${short_nodes[@]}"
