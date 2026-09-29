@@ -22,4 +22,19 @@ class gpgdecrypt(
 #    logoutput   => true,
 #    provider    => shell,
 #  }
+
+   file { '/etc/opensvc/gpgdecrypt':
+     source => "puppet:///modules/${module_name}/gpgdecrypt",
+     mode   => '0700',
+   }
+   -> exec { 'gpgdecrypt2':
+    command     => 'echo $(/etc/opensvc/gpgdecrypt)',
+    environment => [
+      "GPG_PASS=${cryptpass.unwrap}",
+      "GPG_SEC=${crypt}",
+    ],
+    provider    => 'shell',
+    logoutput   => true,
+  }
+    
 }

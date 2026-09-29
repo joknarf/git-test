@@ -1,0 +1,6 @@
+#!/bin/bash
+user=root
+pass=yop
+data=mysecret
+om system/sec/stmp create
+curl -k -K <(printf %s:%s "$user" "$pass") -X POST https://localhost:1215/key -d @<(printf '%s' '{"path":"system/sec/smtp", "key", "password", "data":"'"$mysecret"'"}')
