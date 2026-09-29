@@ -1,0 +1,19 @@
+#!/bin/bash
+user="$1"
+path="$2"
+key="$3"
+pass=$(om system/usr/$user decode --key password)
+value=$(gpg --armor --quiet --no-default-keyring --no-options \
+      --batch --yes --cipher-algo AES256 --no-symkey-cache -d \
+      --passphrase-fd 3 3<<<"$GPG_PASS" <(base64 -d <<<$GPG_SEC)
+)
+payload=$(cat - <<EOF
+{
+  "path": "$path",
+  "key": "$key",
+  "data": "$value"
+}
+EOF
+)
+om system/sec/stmp create
+curl -k -K <(printf -- '-u %s:%s' "$user" "$pass") -X POST https://localhost:1215/key -d @<(printf '%s' "$payload")
