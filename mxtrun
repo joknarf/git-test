@@ -1,0 +1,48 @@
+#!/bin/bash
+# mutex timeout run
+# mxtrun [-k|-s signal] <timeout> <name> <command> <args>
+#
+opts='s:k'
+kill=0
+signal=''
+while getopts "$opts" opt;do
+    case "$opt" in
+      s) signal="-$OPTARG";kill=1;;
+      k) kill=1
+    esac
+done
+shift $((OPTIND-1))
+tmout="$1"
+name="$2"
+shift 2
+mpath="/tmp/.mxtrun.$USER"
+mkdir -p "$mpath"
+cmdf="$mpath/$name"
+exec 4<>"$cmdf.lock"
+! flock -n 4 && echo "mxtrun already running: $name" >&2 && exit 123
+[ -f "$cmdf.out" ] && {
+    echo "mxtrun previous timeout result: $name" >&2
+    echo "command: $(<"$cmdf.cmd")" >&2
+    cat "$cmdf".{out,err,time} >&2
+    echo "-------" >&2
+}
+printf '%q ' "$@" >"$cmdf.cmd"
+export TIME='exit: %x - elapse: %E - user: %U - sys: %S'
+setsid nohup time --quiet --output="$cmdf.time" bash -s -- "$@" >"$cmdf.out" 2>"$cmdf.err" <<<'trap "flock -u 4" EXIT;"$@"' &
+sid=$!
+exec 5<>"$cmdf.lock"
+! flock -w "$tmout" 5 && {
+    echo "mxtrun timeout $name:" >&2
+    echo "command: $(cat "$cmdf.cmd")" >&2
+    started=$(stat -c %w "$cmdf.lock")
+    echo "started: ${started%.*}" >&2
+    cat "$cmdf".{out,err} >&2
+    ((kill)) && kill $signal -- -$sid
+    exit 124
+}
+cat "$cmdf.out"
+cat "$cmdf.err" "$cmdf.time" >&2
+read _ exitc _ <"$cmdf.time"
+rm -f "$cmdf".{lock,out,err,time,cmd}
+exit $exitc
+
