@@ -1,48 +1,152 @@
 #!/bin/bash
 # mutex timeout run
-# mxtrun [-k|-s signal] <timeout> <name> <command> <args>
+# execute command under mutex control and detect hang upon timeout
+# exits after timeout leaving process running or try to kill it (-k/-s)
+# do not allow new command execution if command still running
+# displays stdout/stderr of command with exit code / elapse time when not timed out
+# next run after hang ends displays the last hang command output / result
+# return code is command return code except :
+# timeout exceeded: 124
+# command still running: 123
 #
-opts='s:k'
+# run a mutex command:
+# mxtrun [-t <timeout> [-k|-s <signal>]] [-f] <mutex> <command> <args>
+# kill a mutex still running:
+# mxtrun -k|-s <signal> <mutex>
+#
+
+usage() {
+    cat - >&$(($1+1)) <<'EOF'
+usage: mxtrun [-t timeout [-k|-s <signal>]] [-f] <mutex> <command> <args>
+       mxtrun -k|-s <signal> <mutex>
+
+parameters:
+   -t <timeout> : in seconds, time to wait before exiting
+                  default no timeout (0)
+   -k           : kill command if timeout exceeded or immediately if no timeout
+   -s <signal>  : kill -<signal> command if timeout exceeded or immediately
+   -f           : follow run displaying stdout/stderr during run
+   <mutex>      : name of the mutex to use
+EOF
+    exit "$1"
+}
+
+die() {
+    local e=$1
+    shift
+    echo "mxtrun: $*" >&2
+    exit $e;
+}
+
+opts='hfks:t:'
 kill=0
-signal=''
+signal='TERM'
+tmout=0
+follow=0
+killonly=0
 while getopts "$opts" opt;do
     case "$opt" in
-      s) signal="-$OPTARG";kill=1;;
-      k) kill=1
+      t) tmout="$OPTARG";;
+      f) follow=1;;
+      s) signal="$OPTARG";kill=1;;
+      k) kill=1;;
+      h) usage 0;;
+      *) usage 1;;
     esac
 done
 shift $((OPTIND-1))
-tmout="$1"
-name="$2"
-shift 2
-mpath="/tmp/.mxtrun.$USER"
-mkdir -p "$mpath"
+(($#)) || usage 1
+name="$1"
+shift
+[[ $tmout =~ ^[0-9]+(\.[0-9]+)?$ ]]   || die 2 "invalid timeout: $tmout"
+[[ $name  =~ ^[A-Za-z0-9._-]+$ ]]     || die 2 "invalid mutex name: $name"
+[[ $signal =~ ^[A-Za-z0-9]+$ ]]       || die 2 "invalid signal: $signal"
+[[ $tmout =~ ^0+(\.0+)?$ ]] && tmout=0
+nargs='> 0'
+((kill)) && [ "$tmout" = 0 ] && killonly=1 && nargs='== 0'
+(($# $nargs)) || usage 1
+mpath="${XDG_RUNTIME_DIR:-/tmp}/.mxtrun.$(id -u)"
+mkdir -m 700 -p -- "$mpath" && [[ -O $mpath && ! -L $mpath ]] || die 2 "unsafe state dir"
 cmdf="$mpath/$name"
-exec 4<>"$cmdf.lock"
-! flock -n 4 && echo "mxtrun already running: $name" >&2 && exit 123
-[ -f "$cmdf.out" ] && {
-    echo "mxtrun previous timeout result: $name" >&2
-    echo "command: $(<"$cmdf.cmd")" >&2
-    cat "$cmdf".{out,err,time} >&2
-    echo "-------" >&2
+lockme() {
+    for _ in 1 2 3;do
+        eval "exec $1<>"'"$cmdf.$2"' || die 2 "cannot open lock file $cmdf.$2"
+        flock -n -E 123 "$1" || {
+            [ $? = 123 ] || die 2 "issue locking $cmdf.$2"
+            die 123 "already running on mutex $name"
+        }
+        [[ /dev/fd/$1 -ef $cmdf.$2 ]] && return 0
+    done
+    die 2 "race locking issue"
 }
+kill_cmd() {
+    [ -s "$cmdf.sid" ] || { echo "mxtrun: no process found to kill"; return 1; }
+    flock -n 5 && { echo "mxtrun: no more process running on mutex $name"; return 1; }
+    cmdsid=$(<"$cmdf.sid")
+    [[ $cmdsid =~ ^[0-9]+$ ]] && ((cmdsid>1)) || { echo "mxtrun: bad sid found"; return 1; }
+    echo "mxtrun: killing $cmdsid"
+    kill "-$signal" -- -$cmdsid
+}
+((killonly)) && {
+    [ -e "$cmdf.lock" ] || die 2 "mutex $name not found"
+    exec 5<"$cmdf.lock" || die 2 "cannot open lock file $cmdf.lock"
+    kill_cmd || exit 0
+    echo "command: $(cat "$cmdf.cmd")"
+    echo "started: $(date -r "$cmdf.sid" '+%F %T')"
+    echo "output so far:"
+    cat "$cmdf".{out,err}
+    exit 0
+}
+[[ -x /usr/bin/time ]] || die 2 "GNU time (/usr/bin/time) required"
+lockme 6 mx
+lockme 4 lock
+[ -f "$cmdf.out" ] && {
+    echo "mxtrun: previous timeout result: $name"
+    echo "command: $(<"$cmdf.cmd")"
+    cat "$cmdf".{out,err,time} 2>/dev/null
+    echo "-------"
+} >&2
 printf '%q ' "$@" >"$cmdf.cmd"
 export TIME='exit: %x - elapse: %E - user: %U - sys: %S'
-setsid nohup time --quiet --output="$cmdf.time" bash -s -- "$@" >"$cmdf.out" 2>"$cmdf.err" <<<'trap "flock -u 4" EXIT;"$@"' &
+: >"$cmdf.out"; : >"$cmdf.err"; : >"$cmdf.sid"; >"$cmdf.time"
+setsid /usr/bin/time --quiet --output="$cmdf.time" bash -s -- "$cmdf" "$@" >"$cmdf.out" 2>"$cmdf.err" 6>&- <<<'
+    cmdf="$1";shift
+    trap "flock -u 4" EXIT
+    setsid "$@" & sid=$!
+    echo $sid >"$cmdf.sid"
+    wait $sid
+' &
 sid=$!
-exec 5<>"$cmdf.lock"
-! flock -w "$tmout" 5 && {
-    echo "mxtrun timeout $name:" >&2
-    echo "command: $(cat "$cmdf.cmd")" >&2
-    started=$(stat -c %w "$cmdf.lock")
-    echo "started: ${started%.*}" >&2
-    cat "$cmdf".{out,err} >&2
-    ((kill)) && kill $signal -- -$sid
-    exit 124
+tails=()
+((follow)) && {
+    tail -n +0 -s 0.1 --pid=$sid -f "$cmdf.out" 6>&- & tails+=($!)
+    tail -n +0 -s 0.1 --pid=$sid -f "$cmdf.err" >&2 6>&- & tails+=($!)
 }
-cat "$cmdf.out"
-cat "$cmdf.err" "$cmdf.time" >&2
-read _ exitc _ <"$cmdf.time"
-rm -f "$cmdf".{lock,out,err,time,cmd}
-exit $exitc
+end_run() {
+    wait $sid
+    exitc=$?
+    if ((follow)) ;then
+        wait "${tails[@]}"
+    else
+        cat "$cmdf.out"
+        cat "$cmdf.err" >&2
+    fi
+    cat "$cmdf.time" >&2
+    rm -f -- "$cmdf".{out,err,time,cmd,sid,lock,mx}
+    exit $exitc
+}
+[ "$tmout" = 0 ] && end_run
+exec 5<>"$cmdf.lock" || die 2 "cannot open lock file"
+flock -w "$tmout" -E 123 5 && end_run
+[ $? = 123 ] || die 125 "issue locking $cmdf.lock"
+((follow)) && kill "${tails[@]}"
+{
+    echo
+    echo "mxtrun: timeout $name:"
+    echo "command: $(cat "$cmdf.cmd")"
+    echo "started: $(date -r "$cmdf.sid" '+%F %T')"
+    ((follow)) || cat "$cmdf".{out,err}
+} >&2
+((kill)) && kill_cmd >&2
+exit 124
 
