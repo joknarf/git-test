@@ -12,7 +12,7 @@
 # run a mutex command:
 # mxtrun [-t <timeout> [-k|-s <signal>]] [-f] <mutex> <command> <args>
 # kill a mutex still running:
-# mxtrun -k|-s <signal> <mutex>
+# mxtrun -k|-s <signal> <mutex> (requires pgrep -o -P <pid>)
 #
 
 usage() {
@@ -65,6 +65,7 @@ shift
 nargs='> 0'
 ((kill)) && [ "$tmout" = 0 ] && killonly=1 && nargs='== 0'
 (($# $nargs)) || usage 1
+((killonly && follow)) && usage 1
 mpath="${XDG_RUNTIME_DIR:-/tmp}/.mxtrun.$(id -u)"
 mkdir -m 700 -p -- "$mpath" && [[ -O $mpath && ! -L $mpath ]] || die 2 "unsafe state dir"
 cmdf="$mpath/$name"
@@ -84,39 +85,51 @@ show_cmd() {
     [ -f "$cmdf.cmd" ] && echo "command: $(<"$cmdf.cmd")"
     [ -f "$cmdf.pid" ] && echo "started: $(date -r "$cmdf.pid" '+%F %T')"
 }
+
 tmout_out() {
-    ((follow)) && kill "${tails[@]}"
-    { echo ;echo "mxtrun: timeout ${tmout}s exceeded on $name"; }>&2
+    ((follow)) && {
+       if ((hang)); then kill "${tails[@]}"
+       else wait $pid; wait ${tails[@]}; fi
+    }
+    ((killonly)) || { echo ;echo "mxtrun: timeout ${tmout}s exceeded on $name"; }>&2
     ((hang)) && echo "mxtrun: command still running" >&2 || \
                 echo "mxtrun: command terminated" >&2
-    show_cmd >&2
+    ((killonly)) || show_cmd >&2
     ((follow==0)) && {
         ((hang)) && echo "output so far:" >&2 || echo "output:" >&2
-        cat "$cmdf.out"
-        cat "$cmdf.err" >&2
+        cat "$cmdf.out" 2>/dev/null
+        cat "$cmdf.err" >&2 2>/dev/null
     }
-    cat "$cmdf.time" >&2
+    cat "$cmdf.time" >&2 2>/dev/null
+}
+cleanup_state() {
+    ((killonly)) && {
+        [ -e "$cmdf.mx" ] && exec 4<>"$cmdf.mx" && flock -n 4 || return 0
+    }
+    rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
 }
 kill_check() {
+    hang=0
     flock -w 1 5 || hang=1
     tmout_out
-    ((hang)) || rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
+    ((hang)) || cleanup_state
     return $hang
 }
 kill_cmd() {
     local sid pid
-    show_cmd
+    show_cmd >&2
     [ -s "$cmdf.pid" ] || { echo "mxtrun: no process found to kill"; return 1; }
     flock -n 5 && {
         echo "mxtrun: no more process running on mutex $name"
         cat "$cmdf".{out,err,time} 2>/dev/null 
-        rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
+        cleanup_state
         return 1
     }
     pid=$(<"$cmdf.pid")
     [[ $pid =~ ^[0-9]+$ ]] && ((pid>1)) || { echo "mxtrun: bad pid found"; return 1; }
+    type pgrep >/dev/null 2>&1 || { echo "mxtrun: pgrep required"; return 1; }
     sid=$(pgrep -oP $pid) || { echo "mxtrun: no process found to kill"; return 1; }
-    echo "mxtrun: killing $sid"
+    echo "mxtrun: killing $sid" >&2
     kill "-$signal" -- -$sid
     kill_check
 }
@@ -140,6 +153,7 @@ printf '%q ' "$@" >"$cmdf.cmd"
 export TIME='exit: %x - elapse: %E - user: %U - sys: %S'
 : >"$cmdf.out"; : >"$cmdf.err"; : >"$cmdf.pid"; >"$cmdf.time"
 if ((kill));then
+    type timeout >/dev/null 2>&1 || die 2 "timeout (coreutils) required"
     nohup /usr/bin/time -o "$cmdf.time" timeout -s "$signal" "$tmout" "$@" >"$cmdf.out" 2>"$cmdf.err" 4>&- </dev/null &
 else
     nohup /usr/bin/time -o "$cmdf.time" setsid "$@" >"$cmdf.out" 2>"$cmdf.err" 4>&- </dev/null &
@@ -161,7 +175,7 @@ end_run() {
         cat "$cmdf.err" >&2
     fi
     cat "$cmdf.time" >&2
-    rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
+    cleanup_state
     exit $exitc
 }
 [ "$tmout" = 0 ] && end_run
