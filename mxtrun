@@ -79,51 +79,80 @@ lockme() {
     done
     die 2 "race locking issue"
 }
+
+show_cmd() {
+    [ -f "$cmdf.cmd" ] && echo "command: $(<"$cmdf.cmd")"
+    [ -f "$cmdf.pid" ] && echo "started: $(date -r "$cmdf.pid" '+%F %T')"
+}
+tmout_out() {
+    ((follow)) && kill "${tails[@]}"
+    { echo ;echo "mxtrun: timeout ${tmout}s exceeded on $name"; }>&2
+    ((hang)) && echo "mxtrun: command still running" >&2 || \
+                echo "mxtrun: command terminated" >&2
+    show_cmd >&2
+    ((follow==0)) && {
+        ((hang)) && echo "output so far:" >&2 || echo "output:" >&2
+        cat "$cmdf.out"
+        cat "$cmdf.err" >&2
+    }
+    cat "$cmdf.time" >&2
+}
+kill_check() {
+    flock -w 1 5 || hang=1
+    tmout_out
+    ((hang)) || rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
+    return $hang
+}
 kill_cmd() {
-    [ -s "$cmdf.sid" ] || { echo "mxtrun: no process found to kill"; return 1; }
-    flock -n 5 && { echo "mxtrun: no more process running on mutex $name"; return 1; }
-    cmdsid=$(<"$cmdf.sid")
-    [[ $cmdsid =~ ^[0-9]+$ ]] && ((cmdsid>1)) || { echo "mxtrun: bad sid found"; return 1; }
-    echo "mxtrun: killing $cmdsid"
-    kill "-$signal" -- -$cmdsid
+    local sid pid
+    show_cmd
+    [ -s "$cmdf.pid" ] || { echo "mxtrun: no process found to kill"; return 1; }
+    flock -n 5 && {
+        echo "mxtrun: no more process running on mutex $name"
+        cat "$cmdf".{out,err,time} 2>/dev/null 
+        rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
+        return 1
+    }
+    pid=$(<"$cmdf.pid")
+    [[ $pid =~ ^[0-9]+$ ]] && ((pid>1)) || { echo "mxtrun: bad pid found"; return 1; }
+    sid=$(pgrep -oP $pid) || { echo "mxtrun: no process found to kill"; return 1; }
+    echo "mxtrun: killing $sid"
+    kill "-$signal" -- -$sid
+    kill_check
 }
 ((killonly)) && {
     [ -e "$cmdf.lock" ] || die 2 "mutex $name not found"
     exec 5<"$cmdf.lock" || die 2 "cannot open lock file $cmdf.lock"
-    kill_cmd || exit 0
-    echo "command: $(cat "$cmdf.cmd")"
-    echo "started: $(date -r "$cmdf.sid" '+%F %T')"
-    echo "output so far:"
-    cat "$cmdf".{out,err}
+    kill_cmd || exit 1
     exit 0
 }
 [[ -x /usr/bin/time ]] || die 2 "GNU time (/usr/bin/time) required"
-lockme 6 mx
-lockme 4 lock
+lockme 4 mx
+lockme 5 lock
 [ -f "$cmdf.out" ] && {
-    echo "mxtrun: previous timeout result: $name"
-    echo "command: $(<"$cmdf.cmd")"
+    echo "mxtrun: previous timeout result on $name"
+    show_cmd
+    echo "output:"
     cat "$cmdf".{out,err,time} 2>/dev/null
     echo "-------"
 } >&2
 printf '%q ' "$@" >"$cmdf.cmd"
 export TIME='exit: %x - elapse: %E - user: %U - sys: %S'
-: >"$cmdf.out"; : >"$cmdf.err"; : >"$cmdf.sid"; >"$cmdf.time"
-setsid /usr/bin/time --quiet --output="$cmdf.time" bash -s -- "$cmdf" "$@" >"$cmdf.out" 2>"$cmdf.err" 6>&- <<<'
-    cmdf="$1";shift
-    trap "flock -u 4" EXIT
-    setsid "$@" & sid=$!
-    echo $sid >"$cmdf.sid"
-    wait $sid
-' &
-sid=$!
+: >"$cmdf.out"; : >"$cmdf.err"; : >"$cmdf.pid"; >"$cmdf.time"
+if ((kill));then
+    nohup /usr/bin/time -o "$cmdf.time" timeout -s "$signal" "$tmout" "$@" >"$cmdf.out" 2>"$cmdf.err" 4>&- </dev/null &
+else
+    nohup /usr/bin/time -o "$cmdf.time" setsid "$@" >"$cmdf.out" 2>"$cmdf.err" 4>&- </dev/null &
+fi
+pid=$!
+echo "$pid" >"$cmdf.pid"
 tails=()
 ((follow)) && {
-    tail -n +0 -s 0.1 --pid=$sid -f "$cmdf.out" 6>&- & tails+=($!)
-    tail -n +0 -s 0.1 --pid=$sid -f "$cmdf.err" >&2 6>&- & tails+=($!)
+    tail -n +0 -s 0.1 --pid=$pid -f "$cmdf.out" 4>&- 5>&- & tails+=($!)
+    tail -n +0 -s 0.1 --pid=$pid -f "$cmdf.err" >&2 4>&- 5>&- & tails+=($!)
 }
 end_run() {
-    wait $sid
+    wait $pid
     exitc=$?
     if ((follow)) ;then
         wait "${tails[@]}"
@@ -132,21 +161,15 @@ end_run() {
         cat "$cmdf.err" >&2
     fi
     cat "$cmdf.time" >&2
-    rm -f -- "$cmdf".{out,err,time,cmd,sid,lock,mx}
+    rm -f -- "$cmdf".{out,err,time,cmd,pid,lock,mx}
     exit $exitc
 }
 [ "$tmout" = 0 ] && end_run
 exec 5<>"$cmdf.lock" || die 2 "cannot open lock file"
 flock -w "$tmout" -E 123 5 && end_run
 [ $? = 123 ] || die 125 "issue locking $cmdf.lock"
-((follow)) && kill "${tails[@]}"
-{
-    echo
-    echo "mxtrun: timeout $name:"
-    echo "command: $(cat "$cmdf.cmd")"
-    echo "started: $(date -r "$cmdf.sid" '+%F %T')"
-    ((follow)) || cat "$cmdf".{out,err}
-} >&2
-((kill)) && kill_cmd >&2
+((kill)) && { kill_check; exit 124; }
+hang=1
+tmout_out
 exit 124
 
